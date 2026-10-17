@@ -1,0 +1,156 @@
+# Complete local Hindsight stack for coding-agent memory on one machine,
+# split into three visible services:
+#
+#   db            PostgreSQL + pgvector
+#   hindsight-api FastAPI dataplane (LLM + local ML models live here)
+#   control-plane Next.js admin UI (the "next-server" process)
+#
+# The published standalone image bundles the API and the Control Plane; the
+# HINDSIGHT_ENABLE_API / HINDSIGHT_ENABLE_CP flags turn each half on or off,
+# so one image can run them as separate containers with independent memory
+# footprints in `docker stats`.
+#
+# ML and LLM both run remotely by default, so the API container never loads
+# torch or a local model: chat is Zhipu glm-5.3-flash, embeddings are Zhipu
+# embedding-3 (1024 dimensions, under pgvector's 2000-dim HNSW index limit),
+# and the reranker is the built-in zero-dependency RRF fusion. Every provider,
+# model, endpoint, and key is configurable from the .env file next to this
+# compose file (gitignored); the defaults below just reproduce the original
+# Zhipu setup so existing .env files keep working unchanged.
+#
+# The database image is pulled from Docker Hub (PostgreSQL + pgvector +
+# pgvectorscale), so the stack can switch from pgvector HNSW (<= 2000
+# dimensions) to DiskANN (> 2000 dimensions, e.g. 2048) purely via
+# HINDSIGHT_API_VECTOR_EXTENSION in .env.
+#
+# Quick start:
+#   docker compose -f docker/docker-compose/local/docker-compose.yaml up -d
+#
+# Prerequisite: copy .env.example to .env and set your Zhipu API key.
+
+name: hindsight-local
+
+services:
+  db:
+    # Same extension set as docker/docker-compose/timescale: pgvector plus
+    # pgvectorscale (DiskANN), so >2000-dim embeddings are indexable.
+    # Pull-only prebuilt tag; no build section, so `up` never compiles.
+    image: ${HINDSIGHT_DB_IMAGE:-youbuwei/hindsight-db-pgvectorscale:pg18-pgvs0.9.1}
+    container_name: hindsight-local-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hindsight
+      POSTGRES_PASSWORD: hindsight
+      POSTGRES_DB: hindsight
+    volumes:
+      # postgres:18 moved PGDATA to /var/lib/postgresql/<major>/docker and
+      # refuses a mount at the pre-18 /var/lib/postgresql/data path. Mount the
+      # parent (the layout upstream recommends) so majors can nest inside.
+      - pg_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hindsight -d hindsight"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  db-extensions:
+    # pgvectorscale needs both extensions created in the target database
+    # before Hindsight boots; vectorscale CASCADE also installs pgvector.
+    image: ${HINDSIGHT_DB_IMAGE:-youbuwei/hindsight-db-pgvectorscale:pg18-pgvs0.9.1}
+    container_name: hindsight-local-db-extensions
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: hindsight
+    # List form: a folded block nested under one argv element cannot be
+    # re-split by compose, so quoting survives regardless of shell parsing.
+    command:
+      - bash
+      - -c
+      - >-
+        psql -h db -p 5432 -U hindsight -d hindsight
+        -c 'CREATE EXTENSION IF NOT EXISTS vector CASCADE;'
+        -c 'CREATE EXTENSION IF NOT EXISTS vectorscale CASCADE;'
+
+  hindsight-api:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    container_name: hindsight-local-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      db-extensions:
+        condition: service_completed_successfully
+    ports:
+      # Binds all interfaces so LAN / Tailscale clients can reach the stack
+      # on servers; the container port stays 8888 (internal healthchecks
+      # and the Control Plane connection all target it).
+      - "12888:8888"
+    environment:
+      HINDSIGHT_ENABLE_API: "true"
+      HINDSIGHT_ENABLE_CP: "false"
+      HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:hindsight@db:5432/hindsight
+      # All model settings resolve from .env (Docker Compose interpolates the
+      # project .env file automatically); the :- defaults preserve the Zhipu
+      # setup for .env files that predate these knobs.
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-openai}
+      # Coding-plan endpoint default: plan-covered models (glm-5.3-flash,
+      # glm-5.2) are only entitled here; the general /api/paas/v4 endpoint
+      # rejects them with error 1113 "no available resource package".
+      HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL:-https://open.bigmodel.cn/api/coding/paas/v4}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL:-glm-5.3-flash}
+      # Remote ML default: no torch / sentence-transformers in the API process
+      # (~400 MB less resident memory than the local-model defaults).
+      # provider "openai" + a custom base URL covers any OpenAI-compatible
+      # endpoint (Zhipu, SiliconFlow, Ollama, vLLM, LM Studio, ...); switch
+      # the provider to local/tei/cohere/google in .env for native backends.
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: ${HINDSIGHT_API_EMBEDDINGS_PROVIDER:-openai}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL:-embedding-3}
+      # Keep <= 2000: pgvector's HNSW index caps vector width at 2000 dims.
+      # For wider vectors set HINDSIGHT_API_VECTOR_EXTENSION=pgvectorscale.
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS:-1024}
+      # pgvector (HNSW, <= 2000 dims) | pgvectorscale (DiskANN, wider dims).
+      HINDSIGHT_API_VECTOR_EXTENSION: ${HINDSIGHT_API_VECTOR_EXTENSION:-pgvector}
+      HINDSIGHT_API_RERANKER_PROVIDER: ${HINDSIGHT_API_RERANKER_PROVIDER:-rrf}
+    extra_hosts:
+      # Lets this container reach local ML servers on the host (Ollama,
+      # LM Studio, vLLM) via host.docker.internal. Docker Desktop defines
+      # the name natively and ignores the duplicate mapping; Linux needs it.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python3", "-m", "hindsight_api.http_probe", "http://localhost:8888/health", "5"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+
+  control-plane:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    container_name: hindsight-local-cp
+    restart: unless-stopped
+    depends_on:
+      hindsight-api:
+        condition: service_healthy
+    environment:
+      HINDSIGHT_ENABLE_API: "false"
+      HINDSIGHT_ENABLE_CP: "true"
+      # Service-name DNS inside the Compose network, not localhost: the
+      # dataplane runs in its own container now.
+      HINDSIGHT_CP_DATAPLANE_API_URL: http://hindsight-api:8888
+    ports:
+      - "12999:9999"
+    healthcheck:
+      # The Control Plane has no /health route; probe the dashboard root.
+      test: ["CMD", "python3", "-m", "hindsight_api.http_probe", "http://localhost:9999/", "5"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  pg_data:
